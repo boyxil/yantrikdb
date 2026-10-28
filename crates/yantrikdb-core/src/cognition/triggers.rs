@@ -1166,6 +1166,18 @@ fn parse_persisted_trigger(row: &rusqlite::Row<'_>) -> rusqlite::Result<Persiste
 
 /// Check if two memory texts differ by tokens in the same substitution category.
 /// Returns (category_name, token_a, token_b) if a match is found.
+/// A substitution conflict is the SAME statement with one value swapped
+/// ("prefer Python" vs "prefer Rust"), so the texts must be
+/// lexically near-identical outside the swapped pair. If either side
+/// differs by more tokens than this, the pair is two different
+/// statements that merely MENTION different members of one category —
+/// not a substitution. Measured against production: 50 false-positive
+/// conflict pairs (session summaries mentioning different languages or
+/// providers) had a minimum side diff of 17 tokens; a genuine swap
+/// differs by 1–3 words plus inflection. 8 keeps headroom for
+/// rewording while vetoing every measured false positive.
+const MAX_SUBSTITUTION_DIFF_TOKENS: usize = 8;
+
 fn check_substitution_category_pair(
     conn: &rusqlite::Connection,
     text_a: &str,
@@ -1190,6 +1202,16 @@ fn check_substitution_category_pair(
 
     let diff_a: Vec<&String> = words_a.difference(&words_b).collect();
     let diff_b: Vec<&String> = words_b.difference(&words_a).collect();
+
+    // Mention-vs-assertion gate: a large lexical diff means the two
+    // texts are different statements that happen to mention different
+    // members of the category — firing here produced ~50 false
+    // conflicts on one production deployment (see the constant's doc).
+    if diff_a.len() > MAX_SUBSTITUTION_DIFF_TOKENS
+        || diff_b.len() > MAX_SUBSTITUTION_DIFF_TOKENS
+    {
+        return None;
+    }
 
     // Check each diff token pair against substitution_members
     for ta in &diff_a {
@@ -1225,6 +1247,74 @@ mod tests {
             .collect();
         let norm: f32 = raw.iter().map(|x| x * x).sum::<f32>().sqrt();
         raw.iter().map(|x| x / norm).collect()
+    }
+
+    /// Seed a test-only exclusive category with two members, mirroring
+    /// the production seeding shape (see seed_categories).
+    fn seed_pair_category(db: &YantrikDB, cat: &str, tok_a: &str, tok_b: &str) {
+        use rusqlite::params;
+        let hlc = db.tick_hlc().to_bytes().to_vec();
+        let ts = now();
+        db.conn()
+            .execute(
+                "INSERT INTO substitution_categories
+                 (id, name, conflict_mode, status, created_at, updated_at, hlc, origin_actor)
+                 VALUES (?1, ?1, 'exclusive', 'active', ?2, ?2, ?3, 'test')",
+                params![cat, ts, hlc],
+            )
+            .unwrap();
+        for (i, tok) in [tok_a, tok_b].iter().enumerate() {
+            let hlc = db.tick_hlc().to_bytes().to_vec();
+            db.conn()
+                .execute(
+                    "INSERT INTO substitution_members
+                     (id, category_id, token_normalized, token_display,
+                      confidence, source, status, created_at, updated_at,
+                      hlc, origin_actor)
+                     VALUES (?1, ?2, ?3, ?3, 0.9, 'test', 'active', ?4, ?4, ?5, 'test')",
+                    params![format!("mem-{cat}-{i}"), cat, tok, ts, hlc],
+                )
+                .unwrap();
+        }
+    }
+
+    /// A genuine value swap ("prefer A" vs "prefer B") is lexically
+    /// near-identical: diff sets of size 1 each — fires.
+    #[test]
+    fn substitution_swap_pair_still_fires() {
+        let db = YantrikDB::new(":memory:", 8).unwrap();
+        seed_pair_category(&db, "cat_swap", "zyxqva", "zyxqvb");
+        let hit = check_substitution_category_pair(
+            &*db.conn(),
+            "the team prefers zyxqva for all new services",
+            "the team prefers zyxqvb for all new services",
+        );
+        let (cat, a, b) = hit.expect("single-token swap must fire");
+        assert_eq!(cat, "cat_swap");
+        assert_eq!((a.as_str(), b.as_str()), ("zyxqva", "zyxqvb"));
+    }
+
+    /// Two different statements that merely MENTION different members
+    /// of one category must NOT fire. Regression shape: one production
+    /// deployment accumulated ~50 such conflicts (session summaries
+    /// mentioning different languages/providers; measured min side
+    /// diff = 17 tokens, all >= 17).
+    #[test]
+    fn mention_only_pair_with_large_diff_is_vetoed() {
+        let db = YantrikDB::new(":memory:", 8).unwrap();
+        seed_pair_category(&db, "cat_mention", "zyxqva", "zyxqvb");
+        let long_a = "morning session summary: refactored the ingestion pipeline, \
+                      reviewed dashboards, fixed flaky integration coverage, wrote \
+                      release notes, migrated the queue consumer to batches, and \
+                      prototyped the new zyxqva export path for the analytics team";
+        let long_b = "evening wrap-up: paired on the schema redesign, triaged the \
+                      overnight alerts, benchmarked the cache layer, updated the \
+                      on-call runbook, reviewed contract tests, and prototyped the \
+                      new zyxqvb export path for the finance dashboard";
+        assert!(
+            check_substitution_category_pair(&*db.conn(), long_a, long_b).is_none(),
+            "two different statements mentioning different category members must not fire"
+        );
     }
 
     #[test]
