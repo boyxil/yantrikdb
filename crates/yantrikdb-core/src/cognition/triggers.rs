@@ -1207,9 +1207,7 @@ fn check_substitution_category_pair(
     // texts are different statements that happen to mention different
     // members of the category — firing here produced ~50 false
     // conflicts on one production deployment (see the constant's doc).
-    if diff_a.len() > MAX_SUBSTITUTION_DIFF_TOKENS
-        || diff_b.len() > MAX_SUBSTITUTION_DIFF_TOKENS
-    {
+    if diff_a.len() > MAX_SUBSTITUTION_DIFF_TOKENS || diff_b.len() > MAX_SUBSTITUTION_DIFF_TOKENS {
         return None;
     }
 
