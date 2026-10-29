@@ -82,6 +82,11 @@ pub(crate) fn compression_gist_cannot_seed(m: &MemoryWithEmbedding) -> bool {
 ///     only when a record is about to seed; it is never applied to the
 ///     candidate scan. See [`compression_gist_cannot_seed`] for the case that
 ///     motivates the distinction.
+///   - Two memories in DIFFERENT namespaces never cluster together (issue
+///     #242). The consolidation caller groups by namespace before calling,
+///     but that guard is the caller's responsibility and was silently
+///     absent in mine_topic_clusters — the gate here makes the guarantee
+///     structural instead of caller-dependent.
 pub fn find_clusters(
     memories: &[MemoryWithEmbedding],
     entities_by_rid: Option<&HashMap<String, HashSet<String>>>,
@@ -133,6 +138,12 @@ pub fn find_clusters(
             // Time proximity check
             let time_diff = (memories[j].created_at - memories[i].created_at).abs();
             if time_diff > time_window_days * 86400.0 {
+                continue;
+            }
+
+            // Namespace gate (issue #242): cross-namespace records never
+            // merge, whatever their cosine similarity.
+            if memories[j].namespace != memories[i].namespace {
                 continue;
             }
 
@@ -1317,6 +1328,33 @@ mod tests {
         // since min_cluster_size=2).
         assert_eq!(clusters.len(), 1, "expected one cluster, got {clusters:?}");
         assert_eq!(clusters[0].len(), 5, "all five records must cluster");
+    }
+
+    /// Issue #242: records from different namespaces must never cluster,
+    /// however similar they are. The consolidation caller groups by
+    /// namespace itself, but mine_topic_clusters did not — the gate lives
+    /// in find_clusters so every caller inherits the guarantee.
+    #[test]
+    fn cross_namespace_records_never_cluster() {
+        let emb = vec![1.0f32, 0.0, 0.0, 0.0];
+        let mk = |rid: &str, ns: &str| MemoryWithEmbedding {
+            rid: rid.to_string(),
+            memory_type: "episodic".to_string(),
+            text: format!("note {rid}"),
+            embedding: emb.clone(),
+            created_at: 100.0,
+            importance: 0.5,
+            valence: 0.0,
+            half_life: 604800.0,
+            last_access: 0.0,
+            metadata: serde_json::Value::Null,
+            namespace: ns.to_string(),
+        };
+        let mems = vec![mk("w1", "work"), mk("w2", "work"), mk("p1", "personal")];
+        let clusters = find_clusters(&mems, None, 0.9, f64::MAX, 2, 100, None);
+        assert_eq!(clusters.len(), 1, "only the same-namespace pair clusters, got {clusters:?}");
+        let joined: Vec<&str> = clusters[0].iter().map(|&i| mems[i].rid.as_str()).collect();
+        assert_eq!(joined, vec!["w1", "w2"], "cluster must be the work pair only");
     }
 
     use super::*;
